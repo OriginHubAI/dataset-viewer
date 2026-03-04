@@ -515,8 +515,10 @@ Pclass = 2 AND "Siblings/Spouses Aboard" > 0
 | `Array2D/3D/4D/5D` | 多维数组 | `{"shape": [28, 28], "_type": "Array2D"}` |
 | `Sequence` | 序列 | `{"feature": {...}, "_type": "Sequence"}` |
 | `List` | 列表 | `{"feature": {...}, "_type": "List"}` |
+| `LargeList` | 大型列表 | `{"feature": {...}, "_type": "LargeList"}` |
 | `Dict` | 字典 | `{"key": {...}}` |
 | `Translation` | 翻译 | `{"languages": ["en", "fr"], "_type": "Translation"}` |
+| `TranslationVariableLanguages` | 可变语言翻译 | `{"_type": "TranslationVariableLanguages"}` |
 
 ### 7.2 统计类型
 
@@ -528,7 +530,482 @@ Pclass = 2 AND "Siblings/Spouses Aboard" > 0
 | `string_label` | frequencies, n_unique |
 | `string_text` | length histogram |
 | `bool` | frequencies |
+| `list` | length histogram |
+| `audio` | duration histogram |
+| `image` | width histogram |
 | `datetime` | min, max, mean, median, std, histogram |
+
+### 7.3 代码架构
+
+#### 7.3.1 特征处理架构
+
+特征类型的处理主要位于 `libs/libcommon/src/libcommon/viewer_utils/features.py`：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Feature Processing                           │
+│              (libs/libcommon/src/libcommon/viewer_utils/features.py) │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────┐    ┌─────────────┐    ┌─────────────────────┐   │
+│  │  Value Types    │    │ Media Types │    │  Container Types    │   │
+│  │  - Value        │    │ - Image     │    │  - List             │   │
+│  │  - ClassLabel   │    │ - Audio     │    │  - LargeList        │   │
+│  │  - ArrayXD      │    │ - Video     │    │  - Sequence         │   │
+│  │  - Translation  │    │ - Pdf       │    │  - Dict             │   │
+│  └─────────────────┘    └──────┬──────┘    └─────────────────────┘   │
+│                                 │                                   │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │                    get_cell_value()                          │    │
+│  │         Main dispatch function for type processing          │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                 │                                   │
+│           ┌─────────────────────┴─────────────────────┐             │
+│           ▼                                         ▼             │
+│  ┌───────────────────────┐              ┌───────────────────────┐  │
+│  │  Media Asset Creation │              │  Nested Processing    │  │
+│  │  - create_image_file()│              │  - Recursive list/dict│  │
+│  │  - create_audio_file()│              │    handling           │  │
+│  │  - create_video_file()│              │  - json_path tracking │  │
+│  │  - create_pdf_file()  │              │    for nested items   │  │
+│  └───────────────────────┘              └───────────────────────┘  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**核心函数说明：**
+
+| 函数 | 路径 | 职责 |
+|------|------|------|
+| `get_cell_value()` | `features.py:384` | 特征类型分发处理主函数 |
+| `image()` | `features.py:82` | 处理 Image 类型，生成缩略图并上传到 S3 |
+| `audio()` | `features.py:134` | 处理 Audio 类型，支持格式转换（统一转为 wav/mp3/opus） |
+| `video()` | `features.py:255` | 处理 Video 类型，直接存储原始字节或路径 |
+| `pdf()` | `features.py:339` | 处理 Pdf 类型，生成缩略图并上传 |
+| `to_features_list()` | `features.py:551` | 将 Features 对象转换为列表格式 |
+
+**媒体文件资产结构（`libs/libcommon/src/libcommon/viewer_utils/asset.py`）：**
+
+```python
+# 图像资产返回格式
+ImageSource: {
+    "src": str,      # CDN URL
+    "height": int,   # 像素高度
+    "width": int     # 像素宽度
+}
+
+# 音频资产返回格式
+AudioSource: {
+    "src": str,      # CDN URL
+    "type": str      # MIME type (audio/wav, audio/mpeg, audio/ogg)
+}
+
+# 视频资产返回格式
+VideoSource: {
+    "src": str       # CDN URL or original path
+}
+
+# PDF资产返回格式
+PDFSource: {
+    "src": str,           # CDN URL
+    "size_bytes": int,    # 文件大小
+    "thumbnail": ImageSource  # 缩略图
+}
+```
+
+#### 7.3.2 统计计算架构
+
+统计类型处理位于 `libs/libcommon/src/libcommon/statistics_utils.py`，采用面向对象设计：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Statistics Computation                          │
+│           (libs/libcommon/src/libcommon/statistics_utils.py)        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                      Column (ABC)                             │   │
+│  │                   Abstract Base Class                       │   │
+│  │  - compute_statistics()  → SupportedStatistics               │   │
+│  │  - compute_and_prepare_response() → StatisticsPerColumnItem│   │
+│  └────────────────┬────────────────────────────────────────────┘   │
+│                   │                                                 │
+│    ┌──────────────┼──────────────┬──────────────┬─────────────┐  │
+│    │              │              │              │             │  │
+│    ▼              ▼              ▼              ▼             ▼  │
+│ ┌───────┐    ┌───────┐    ┌───────────┐   ┌───────┐    ┌────────┐│
+│ │Float  │    │ Int   │    │ String    │   │ Bool  │    │ List   ││
+│ │Column │    │Column │    │ Column    │   │Column │    │Column  ││
+│ └───────┘    └───────┘    └───────┬───┘   └───────┘    └────────┘│
+│                                   │                                │
+│              ┌────────────────────┼────────────────────┐          │
+│              │                    │                    │          │
+│              ▼                    ▼                    ▼          │
+│       ┌──────────┐        ┌──────────┐        ┌──────────┐       │
+│       │ ClassLabel│        │ StringLabel│       │ StringText │       │
+│       │ Column   │        │ (分类标签)  │        │ (长文本)   │       │
+│       └──────────┘        └──────────┘        └──────────┘       │
+│                                                                    │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │                    MediaColumn (ABC)                        │  │
+│  │              媒体类型统计基类（处理Parquet文件）            │  │
+│  └────────────────┬────────────────────────────────────────────┘  │
+│                   │                                              │
+│        ┌──────────┴──────────┐                                   │
+│        ▼                     ▼                                   │
+│  ┌─────────────┐      ┌─────────────┐                           │
+│  │ AudioColumn │      │ ImageColumn │                           │
+│  │ (duration)  │      │ (width)     │                           │
+│  └─────────────┘      └─────────────┘                           │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**统计类型枚举定义：**
+
+```python
+class ColumnType(str, enum.Enum):
+    FLOAT = "float"
+    INT = "int"
+    BOOL = "bool"
+    LIST = "list"
+    CLASS_LABEL = "class_label"
+    STRING_LABEL = "string_label"
+    STRING_TEXT = "string_text"
+    AUDIO = "audio"
+    IMAGE = "image"
+    DATETIME = "datetime"
+```
+
+**统计项数据结构：**
+
+```python
+# 数值统计
+NumericalStatisticsItem: {
+    "nan_count": int,
+    "nan_proportion": float,
+    "min": float | int | None,
+    "max": float | int | None,
+    "mean": float | None,
+    "median": float | None,
+    "std": float | None,
+    "histogram": Histogram | None
+}
+
+# 分类统计
+CategoricalStatisticsItem: {
+    "nan_count": int,
+    "nan_proportion": float,
+    "no_label_count": int,
+    "no_label_proportion": float,
+    "n_unique": int,
+    "frequencies": dict[str, int]
+}
+
+# 布尔统计
+BoolStatisticsItem: {
+    "nan_count": int,
+    "nan_proportion": float,
+    "frequencies": dict[str, int]
+}
+
+# 日期时间统计
+DatetimeStatisticsItem: {
+    "nan_count": int,
+    "nan_proportion": float,
+    "min": str | None,
+    "max": str | None,
+    "mean": str | None,
+    "median": str | None,
+    "std": str | None,  # timedelta string
+    "histogram": DatetimeHistogram | None
+}
+```
+
+#### 7.3.3 DTO 定义
+
+数据传输对象定义位于 `libs/libcommon/src/libcommon/dtos.py`：
+
+```python
+# 特征项定义
+FeatureItem: {
+    "feature_idx": int,    # 特征索引
+    "name": str,           # 特征名称
+    "type": dict[str, Any] # 特征类型定义
+}
+
+# 行项定义
+RowItem: {
+    "row_idx": int,        # 行索引
+    "row": dict[str, Any], # 行数据
+    "truncated_cells": list[str] # 被截断的列名
+}
+
+# 分页响应
+PaginatedResponse: {
+    "features": list[FeatureItem],
+    "rows": list[RowItem],
+    "num_rows_total": int,
+    "num_rows_per_page": int,
+    "partial": bool
+}
+
+# 前100行响应
+SplitFirstRowsResponse: {
+    "dataset": str,
+    "config": str,
+    "split": str,
+    "features": list[FeatureItem],
+    "rows": list[RowItem],
+    "truncated": bool
+}
+```
+
+### 7.4 使用接口文档
+
+#### 7.4.1 OpenAPI Schema 定义
+
+完整的数据类型 Schema 定义位于 `docs/source/openapi.json`。
+
+**特征类型 Schema 结构：**
+
+```json
+{
+  "Feature": {
+    "oneOf": [
+      {"$ref": "#/components/schemas/ValueFeature"},
+      {"$ref": "#/components/schemas/ClassLabelFeature"},
+      {"$ref": "#/components/schemas/ArrayXDFeature"},
+      {"$ref": "#/components/schemas/TranslationFeature"},
+      {"$ref": "#/components/schemas/SequenceFeature"},
+      {"$ref": "#/components/schemas/ListFeature"},
+      {"$ref": "#/components/schemas/LargeListFeature"},
+      {"$ref": "#/components/schemas/DictFeature"},
+      {"$ref": "#/components/schemas/AudioFeature"},
+      {"$ref": "#/components/schemas/ImageFeature"},
+      {"$ref": "#/components/schemas/VideoFeature"},
+      {"$ref": "#/components/schemas/PdfFeature"}
+    ]
+  }
+}
+```
+
+**单元格值 Schema 结构：**
+
+```json
+{
+  "Cell": {
+    "oneOf": [
+      {"$ref": "#/components/schemas/ValueCell"},           // 标量值
+      {"$ref": "#/components/schemas/ClassLabelCell"},    // 整数标签
+      {"$ref": "#/components/schemas/Array2DCell"},         // 2D数组
+      {"$ref": "#/components/schemas/AudioCell"},           // 音频URL列表
+      {"$ref": "#/components/schemas/ImageCell"},            // 图像URL+尺寸
+      {"$ref": "#/components/schemas/VideoCell"},           // 视频URL
+      {"$ref": "#/components/schemas/PdfCell"},             // PDF URL+缩略图
+      {"$ref": "#/components/schemas/ListCell"},             // 嵌套列表
+      {"$ref": "#/components/schemas/DictCell"}             // 嵌套字典
+    ]
+  }
+}
+```
+
+#### 7.4.2 API 响应示例
+
+**Value 类型响应：**
+
+```json
+{
+  "features": [
+    {
+      "feature_idx": 0,
+      "name": "text",
+      "type": {"dtype": "string", "_type": "Value"}
+    },
+    {
+      "feature_idx": 1,
+      "name": "label",
+      "type": {"dtype": "int64", "_type": "Value"}
+    }
+  ],
+  "rows": [
+    {
+      "row_idx": 0,
+      "row": {
+        "text": "Sample text data",
+        "label": 1
+      },
+      "truncated_cells": []
+    }
+  ]
+}
+```
+
+**Image 类型响应：**
+
+```json
+{
+  "features": [
+    {
+      "feature_idx": 0,
+      "name": "image",
+      "type": {"_type": "Image"}
+    }
+  ],
+  "rows": [
+    {
+      "row_idx": 0,
+      "row": {
+        "image": {
+          "src": "https://datasets-server.huggingface.co/assets/.../image.jpg",
+          "height": 256,
+          "width": 256
+        }
+      },
+      "truncated_cells": []
+    }
+  ]
+}
+```
+
+**Audio 类型响应：**
+
+```json
+{
+  "features": [
+    {
+      "feature_idx": 0,
+      "name": "audio",
+      "type": {"sampling_rate": 16000, "_type": "Audio"}
+    }
+  ],
+  "rows": [
+    {
+      "row_idx": 0,
+      "row": {
+        "audio": [
+          {
+            "src": "https://datasets-server.huggingface.co/assets/.../audio.wav",
+            "type": "audio/wav"
+          }
+        ]
+      },
+      "truncated_cells": []
+    }
+  ]
+}
+```
+
+**Nested 类型响应（List/Dict）：**
+
+```json
+{
+  "features": [
+    {
+      "feature_idx": 0,
+      "name": "answers",
+      "type": {
+        "feature": {"dtype": "string", "_type": "Value"},
+        "_type": "List"
+      }
+    }
+  ],
+  "rows": [
+    {
+      "row_idx": 0,
+      "row": {
+        "answers": ["Answer 1", "Answer 2", "Answer 3"]
+      },
+      "truncated_cells": []
+    }
+  ]
+}
+```
+
+#### 7.4.3 统计 API 响应示例
+
+**数值列统计：**
+
+```json
+{
+  "column_name": "alcohol",
+  "column_type": "float",
+  "column_statistics": {
+    "nan_count": 0,
+    "nan_proportion": 0.0,
+    "min": 8.0,
+    "max": 14.9,
+    "mean": 10.4918,
+    "median": 10.3,
+    "std": 1.19271,
+    "histogram": {
+      "hist": [40, 1133, 1662, 1156, 1092, 628, 569, 175, 41, 1],
+      "bin_edges": [8.0, 8.69, 9.38, 10.07, 10.76, 11.45, 12.14, 12.83, 13.52, 14.21, 14.9]
+    }
+  }
+}
+```
+
+**分类列统计：**
+
+```json
+{
+  "column_name": "label",
+  "column_type": "class_label",
+  "column_statistics": {
+    "nan_count": 0,
+    "nan_proportion": 0.0,
+    "no_label_count": 0,
+    "no_label_proportion": 0.0,
+    "n_unique": 2,
+    "frequencies": {"red": 1599, "white": 4898}
+  }
+}
+```
+
+**字符串列统计（长文本）：**
+
+```json
+{
+  "column_name": "text",
+  "column_type": "string_text",
+  "column_statistics": {
+    "nan_count": 0,
+    "nan_proportion": 0.0,
+    "min": 11,
+    "max": 296,
+    "mean": 97.46649,
+    "median": 88.0,
+    "std": 55.82714,
+    "histogram": {
+      "hist": [171, 224, 235, 180, 102, 99, 53, 28, 10, 2],
+      "bin_edges": [11, 40, 69, 98, 127, 156, 185, 214, 243, 272, 296]
+    }
+  }
+}
+```
+
+**日期时间列统计：**
+
+```json
+{
+  "column_name": "charttime",
+  "column_type": "datetime",
+  "column_statistics": {
+    "nan_count": 0,
+    "nan_proportion": 0.0,
+    "min": "2110-01-13 09:39:00",
+    "max": "2214-07-26 08:00:00",
+    "mean": "2153-03-20 23:15:24",
+    "median": "2153-01-19 04:19:30",
+    "std": "8691 days, 20:22:21",
+    "histogram": {
+      "hist": [644662, 824869, 883173, 884980, 861445, 863916, 838647, 664347, 156213, 30922],
+      "bin_edges": ["2110-01-13 09:39:00", "2120-06-27 07:05:07", ...]
+    }
+  }
+}
+```
 
 ---
 
